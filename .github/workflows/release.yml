@@ -153,7 +153,18 @@ jobs:
           set -euo pipefail
           gh run download "${{ steps.build.outputs.run-id }}" --name "${{ inputs.artifact-name }}" --dir release-assets
           # The exact binary internal testers already ran -- not a rebuild.
-          for f in release-assets/*; do
+          # Only the build products. Belt and braces against an artifact built by
+          # an older version of testflight.yml, which also carried xcodebuild's
+          # packaging byproducts -- identically named across the two platform jobs,
+          # so both would race to attach the same asset and one would 422.
+          shopt -s nullglob
+          FILES=(release-assets/*.ipa release-assets/*.pkg)
+          if [ ${#FILES[@]} -eq 0 ]; then
+            echo "::error::No .ipa or .pkg in artifact '${{ inputs.artifact-name }}'."
+            ls -la release-assets/
+            exit 1
+          fi
+          for f in "${FILES[@]}"; do
             gh release upload "$TAG" "$f" --clobber
           done
 

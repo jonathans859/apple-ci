@@ -367,13 +367,19 @@ jobs:
             $ARGS \
             --test-notes "$NOTES" \
             --locale en-US
-          cp "$FILE" "$RUNNER_TEMP/" 2>/dev/null || true
-          echo "UPLOADED_FILE=$FILE" >> "$GITHUB_ENV"
+          # Stage ONLY the build product for the artifact. xcodebuild also leaves
+          # DistributionSummary.plist, ExportOptions.plist and Packaging.log in the
+          # export directory; shipping those in the artifact put them on the GitHub
+          # release, and -- because both platform jobs produce identically named
+          # copies -- made the two jobs race to attach the same asset name, which
+          # GitHub rejects with HTTP 422.
+          mkdir -p "$RUNNER_TEMP/artifact"
+          cp "$FILE" "$RUNNER_TEMP/artifact/"
 
       - name: Upload the build as an artifact
         if: inputs.artifact-name != ''
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact-name }}
-          path: ${{ runner.temp }}/export/*
+          path: ${{ runner.temp }}/artifact/*
           if-no-files-found: warn
