@@ -86,6 +86,13 @@ To release a change: merge to `main`, let the canary build, then move the tag.
 git tag -f v1 && git push -f origin v1
 ```
 
+**A re-run will not pick up a fix here.** GitHub resolves a reusable workflow
+reference when the run is *created* and pins it for that run's lifetime, so
+`gh run rerun` replays the old version of this repo and fails identically. After
+changing anything here, trigger a **new** run — `gh workflow run <file> --ref main`,
+or push a commit. (Same family as release-triggered workflows running the YAML
+from the tagged commit.)
+
 ## Conventions this encodes
 
 Decisions that were inconsistent across the six repos and are now settled here:
