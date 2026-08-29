@@ -99,6 +99,13 @@ To release a change: merge to `main`, let the canary build, then move the tag.
 git tag -f v1 && git push -f origin v1
 ```
 
+**Re-running a build on the same commit always fails at the upload**, with "The
+bundle version must be higher than the previously uploaded version" — the build
+number is derived from the commit count, so a second run of one commit computes a
+number App Store Connect already has. That is correct behaviour, and it means
+`workflow_dispatch` is not a way to test this workflow end to end: everything up
+to the upload runs, then the upload is rejected. Test with a real commit.
+
 **A re-run will not pick up a fix here.** GitHub resolves a reusable workflow
 reference when the run is *created* and pins it for that run's lifetime, so
 `gh run rerun` replays the old version of this repo and fails identically. After
