@@ -1,0 +1,251 @@
+name: Release to external testers (reusable)
+
+# Promote, don't rebuild.
+#
+# Every push to main already archives, signs and uploads a build that internal
+# testers receive. Publishing a GitHub release does NOT build again: it finds
+# that commit's existing build, attaches its signed artifact to the release, and
+# hands the byte-identical binary to external testers.
+#
+# Two reasons this is the house style rather than rebuilding:
+#   - External testers get the SAME binary internal testers already ran. A
+#     rebuild is a different binary that nobody has tested.
+#   - It needs no Xcode, so it runs on ubuntu (1x) instead of idling a macOS
+#     runner (10x) through App Store Connect's processing wait -- which for macOS
+#     builds has been observed to take over an hour.
+#
+# The caller must grant:
+#   permissions: { contents: write, actions: read }
+# contents to attach the artifact to the release, actions to find and download
+# the build run.
+
+on:
+  workflow_call:
+    inputs:
+      app-id:
+        description: 'App Store Connect numeric app id'
+        required: true
+        type: string
+      build-workflow:
+        description: "Caller's build workflow file name, waited on for the tagged commit"
+        default: 'build.yml'
+        type: string
+      artifact-name:
+        description: 'Artifact from that run to attach to the GitHub release. Empty skips attaching.'
+        default: ''
+        type: string
+      platforms:
+        description: 'Space-separated: IOS, MAC_OS. Both for a universal-purchase record.'
+        default: 'IOS'
+        type: string
+      groups:
+        description: 'Comma-separated external group names, exactly as named in App Store Connect'
+        default: 'External'
+        type: string
+      version-source:
+        description: 'xcodegen or pbxproj — where MARKETING_VERSION is read from, to validate the tag'
+        default: 'xcodegen'
+        type: string
+      version-file:
+        description: 'The xcodegen spec, or the .xcodeproj for pbxproj'
+        default: 'project.yml'
+        type: string
+      working-directory:
+        default: '.'
+        type: string
+      wait-minutes:
+        description: 'How long to wait for the tagged commit to finish building'
+        default: 30
+        type: number
+      attempts:
+        description: 'Retries while the build is still processing in App Store Connect'
+        default: 30
+        type: number
+      asc-version:
+        default: '4.10.0'
+        type: string
+
+jobs:
+  release:
+    name: External testers
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate the tag against the project
+        id: version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          SOURCE: ${{ inputs.version-source }}
+          FILE: ${{ inputs.version-file }}
+        run: |
+          set -euo pipefail
+          if [ "$SOURCE" = "pbxproj" ]; then
+            VERSION=$(sed -n 's/^[[:space:]]*MARKETING_VERSION = \(.*\);$/\1/p' "$FILE/project.pbxproj" | head -1)
+          else
+            VERSION=$(sed -n 's/^ *MARKETING_VERSION: *"\{0,1\}\([^"]*\)"\{0,1\}.*/\1/p' "$FILE" | head -1)
+          fi
+          [ -n "$VERSION" ] || { echo "::error::Could not read MARKETING_VERSION from $FILE"; exit 1; }
+          # vX.Y.Z raises the marketing version -- its first external build waits
+          # on Beta App Review. vX.Y.Z-bN re-releases the SAME version from a later
+          # commit and usually reaches external testers review-free, which makes it
+          # the right default for small fixes.
+          TAG_VERSION="${TAG#v}"; TAG_VERSION="${TAG_VERSION%%-b*}"
+          if [ "$TAG_VERSION" != "$VERSION" ]; then
+            echo "::error::Tag $TAG implies version $TAG_VERSION but the project says $VERSION at this commit."
+            exit 1
+          fi
+          echo "marketing=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Releasing $VERSION from $TAG"
+
+      - name: Check the release body is usable as What to Test
+        env:
+          BODY: ${{ github.event.release.body }}
+        run: |
+          # TestFlight renders this as RAW text, not markdown -- which is also the
+          # screen-reader-friendliest form.
+          [ -n "$BODY" ] || { echo "::error::The release body is empty; it is the What to Test text testers read."; exit 1; }
+
+      - name: Wait for the tagged commit's build
+        id: build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WF: ${{ inputs.build-workflow }}
+          MINUTES: ${{ inputs.wait-minutes }}
+        run: |
+          set -uo pipefail
+          # The build must be of the EXACT tagged SHA. Consequence worth knowing:
+          # never tag a commit the build workflow skips via paths-ignore (a docs- or
+          # CI-only commit) -- this will wait it out and then fail. Tag the latest
+          # commit that actually built.
+          for i in $(seq 1 $((MINUTES * 2))); do
+            RUN=$(gh run list --workflow "$WF" --commit "$GITHUB_SHA" --status success \
+                    --json databaseId --jq '.[0].databaseId')
+            if [ -n "$RUN" ]; then
+              echo "run-id=$RUN" >> "$GITHUB_OUTPUT"
+              echo "Found successful build run $RUN"
+              exit 0
+            fi
+            FAILED=$(gh run list --workflow "$WF" --commit "$GITHUB_SHA" --status failure \
+                       --json databaseId --jq '.[0].databaseId')
+            if [ -n "$FAILED" ]; then
+              echo "::error::$WF failed for $GITHUB_SHA (run $FAILED). Fix the build, then re-run this workflow from the release."
+              exit 1
+            fi
+            echo "No successful build for $GITHUB_SHA yet ($i)"
+            sleep 30
+          done
+          echo "::error::Timed out waiting for a successful $WF run for $GITHUB_SHA."
+          exit 1
+
+      - name: Attach the signed build to the GitHub release
+        if: inputs.artifact-name != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          gh run download "${{ steps.build.outputs.run-id }}" --name "${{ inputs.artifact-name }}" --dir release-assets
+          # The exact binary internal testers already ran -- not a rebuild.
+          for f in release-assets/*; do
+            gh release upload "$TAG" "$f" --clobber
+          done
+
+      - name: Install asc
+        env:
+          V: ${{ inputs.asc-version }}
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in aarch64|arm64) ARCH=arm64 ;; *) ARCH=amd64 ;; esac
+          BIN="asc_${V}_linux_${ARCH}"
+          BASE="https://github.com/rorkai/App-Store-Connect-CLI/releases/download/${V}"
+          curl -fsSL -o /tmp/asc "$BASE/$BIN"
+          curl -fsSL -o /tmp/asc_checksums.txt "$BASE/asc_${V}_checksums.txt"
+          EXPECTED=$(grep " ${BIN}\$" /tmp/asc_checksums.txt | awk '{print $1}')
+          ACTUAL=$(sha256sum /tmp/asc | awk '{print $1}')
+          if [ -z "$EXPECTED" ] || [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "::error::asc checksum mismatch for $BIN"
+            exit 1
+          fi
+          chmod +x /tmp/asc && sudo mv /tmp/asc /usr/local/bin/asc
+          asc --version
+
+      - name: Authenticate asc
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          KEY="$RUNNER_TEMP/AuthKey.p8"
+          if printf '%s' "$ASC_KEY_P8" | base64 --decode 2>/dev/null | grep -q "BEGIN PRIVATE KEY"; then
+            printf '%s' "$ASC_KEY_P8" | base64 --decode > "$KEY"
+          else
+            printf '%s' "$ASC_KEY_P8" > "$KEY"
+          fi
+          grep -q "BEGIN PRIVATE KEY" "$KEY" || { echo "::error::ASC_KEY_P8 is not a valid .p8 key."; exit 1; }
+          # asc refuses a key file others can read ("private key file is too
+          # permissive"), which is right -- this one opens the whole account.
+          chmod 600 "$KEY"
+          asc auth login --bypass-keychain --name ci \
+            --key-id "$ASC_KEY_ID" --issuer-id "$ASC_ISSUER_ID" --private-key "$KEY"
+
+      - name: Distribute to external testers
+        env:
+          APP: ${{ inputs.app-id }}
+          MARKETING: ${{ steps.version.outputs.marketing }}
+          PLATFORMS: ${{ inputs.platforms }}
+          GROUPS: ${{ inputs.groups }}
+          ATTEMPTS: ${{ inputs.attempts }}
+          NOTES: ${{ github.event.release.body }}
+        run: |
+          set -uo pipefail
+          # The build number is NOT recomputed from the commit count: it ends in a
+          # run-attempt digit, so a re-run of the build makes it unguessable from a
+          # tag. Ask App Store Connect for the newest build of this marketing
+          # version on this platform instead -- that is the one the tagged commit
+          # just produced.
+          newest_build () {
+            asc builds list --app "$APP" --version "$MARKETING" --platform "$1" \
+              --sort -uploadedDate --output json 2>/dev/null \
+              | jq -r '.data[0].attributes.version // empty'
+          }
+          # --submit --confirm puts it into Beta App Review, which is per marketing
+          # VERSION and not per build: the first build of a new version waits, later
+          # builds of the same version usually go straight out.
+          # The build already carries the push changelog as its What to Test. A
+          # release supersedes that with the release notes, which is the text the
+          # external testers actually read -- so it is rewritten on the existing
+          # build rather than set at upload time. update fails when no localization
+          # exists yet, hence the create fallback.
+          set_notes () { # $1 = platform, $2 = build number
+            asc builds test-notes update --app "$APP" --version "$MARKETING" \
+              --build-number "$2" --platform "$1" --locale en-US --whats-new "$NOTES" \
+            || asc builds test-notes create --app "$APP" --version "$MARKETING" \
+              --build-number "$2" --platform "$1" --locale en-US --whats-new "$NOTES"
+          }
+          for platform in $PLATFORMS; do
+            n=0
+            while true; do
+              BUILD=$(newest_build "$platform")
+              if [ -n "$BUILD" ] && set_notes "$platform" "$BUILD" && asc builds add-groups \
+                   --app "$APP" --version "$MARKETING" --build-number "$BUILD" \
+                   --platform "$platform" --group "$GROUPS" --submit --confirm; then
+                echo "$platform build $BUILD distributed to $GROUPS"
+                break
+              fi
+              n=$((n + 1))
+              if [ "$n" -ge "$ATTEMPTS" ]; then
+                echo "::error::External distribution for $platform failed after $n attempts. The build may still be processing; re-run this job."
+                exit 1
+              fi
+              echo "Build for $platform not ready yet (attempt $n) — waiting 180s for App Store Connect processing"
+              sleep 180
+            done
+          done

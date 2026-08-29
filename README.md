@@ -15,8 +15,8 @@ repos. Under this repo it is one commit and a tag.
 
 | Workflow | Runs on | Does |
 |---|---|---|
-| `testflight.yml` | macOS | archive → export → upload to TestFlight, for `ios` or `macos` |
-| `distribute.yml` | ubuntu | promote an already-uploaded build to external testers |
+| `testflight.yml` | macOS | on every push: archive → export → upload to TestFlight (internal testers) |
+| `release.yml` | ubuntu | on a published release: promote that commit's existing build to external testers |
 
 TestFlight only. RemKeys' Developer ID + notarization lane and its Windows agent
 stay in that repo — they're genuinely one-off, and the duplication was never
@@ -49,15 +49,28 @@ jobs:
       xcodegen-spec: project.yml
       artifact-name: GLiNetAccess-ipa
 
+```
+
+A release is a **separate workflow**, because it must not rebuild:
+
+```yaml
+name: Release
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write   # attach the signed build to the release
+  actions: read     # find and download the build run
+
+jobs:
   external:
-    if: github.event_name == 'release'
-    needs: ios
-    uses: jonathans859/apple-ci/.github/workflows/distribute.yml@v1
+    uses: jonathans859/apple-ci/.github/workflows/release.yml@v1
     secrets: inherit
     with:
       app-id: "6801759784"
-      marketing: ${{ needs.ios.outputs.marketing }}
-      build: ${{ needs.ios.outputs.build }}
+      build-workflow: build.yml
+      artifact-name: GLiNetAccess-ipa
       platforms: IOS
 ```
 
@@ -106,9 +119,13 @@ Decisions that were inconsistent across the six repos and are now settled here:
 - **Verification.** A green build does not prove signing works. A revoked `.p12`
   still imports cleanly and still passes `security find-identity`. Check with
   `asc certificates list` after a build and confirm no new certificate appeared.
-- **Build numbers.** `<commit count>.<kind>.<run attempt>` — monotonic on main,
-  recomputable from any checkout, distinct between the push build and the release
-  build of the same commit, and unique across re-runs.
+- **Promote, don't rebuild.** A release ships the binary the push already built
+  and internal testers already ran — not a fresh archive nobody has seen. It also
+  keeps a 10× macOS runner out of App Store Connect's processing wait.
+- **Build numbers.** `<commit count>.0.<run attempt>` — monotonic on main and
+  unique across re-runs. The release workflow does not recompute it (the attempt
+  digit is unguessable from a tag); it asks App Store Connect for the newest build
+  of the tagged marketing version instead.
 - **Versions must reach the bundle.** `manageAppVersionAndBuildNumber` is off, and
   a caller using XcodeGen must map the settings into its plist:
   `CFBundleShortVersionString: $(MARKETING_VERSION)` and

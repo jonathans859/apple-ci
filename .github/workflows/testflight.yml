@@ -168,7 +168,6 @@ jobs:
       - name: Work out the version and build number
         id: version
         env:
-          TAG: ${{ github.event.release.tag_name }}
           SPEC: ${{ inputs.xcodegen-spec }}
           PROJECT: ${{ inputs.project }}
           SOURCE: ${{ inputs.version-source }}
@@ -181,19 +180,11 @@ jobs:
           fi
           [ -n "$VERSION" ] || { echo "::error::Could not read MARKETING_VERSION"; exit 1; }
 
-          if [ "${{ github.event_name }}" = "release" ]; then
-            # vX.Y.Z raises the marketing version (its first external build waits
-            # on Beta App Review). vX.Y.Z-bN re-releases the SAME version, which
-            # usually reaches external testers review-free.
-            TAG_VERSION="${TAG#v}"; TAG_VERSION="${TAG_VERSION%%-b*}"
-            if [ "$TAG_VERSION" != "$VERSION" ]; then
-              echo "::error::Tag $TAG implies version $TAG_VERSION but the project says $VERSION at this commit."
-              exit 1
-            fi
-            KIND=1
-          else
-            KIND=0
-          fi
+          # KIND is always 0 now: a release does not rebuild (see release.yml --
+          # it promotes the build this push already produced), so there is never a
+          # second build of one commit to keep distinct. Kept in the format so the
+          # numbering stays comparable with builds minted before that change.
+          KIND=0
           # commit count is monotonic on main and recomputable from any checkout;
           # KIND keeps the push build and the release build of one commit distinct;
           # the run attempt keeps a re-run unique after an attempt already uploaded.
@@ -331,24 +322,18 @@ jobs:
         id: notes
         env:
           PUSH_BEFORE: ${{ github.event.before }}
-          RELEASE_BODY: ${{ github.event.release.body }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "release" ]; then
-            NOTES="$RELEASE_BODY"
-            [ -n "$NOTES" ] || { echo "::error::The release body is empty — it is the What to Test text testers read."; exit 1; }
-          else
-            # EVERY subject in the push, not just the head commit. A push is
-            # usually several commits and the head one is routinely the least
-            # interesting -- a docs commit riding along behind the actual change.
-            # PUSH_BEFORE is all-zeros on a branch's first push and stale after a
-            # force-push, so fall back whenever the range is unusable.
-            NOTES=""
-            if [ -n "${PUSH_BEFORE:-}" ] && git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
-              NOTES="$(git log --reverse --pretty='- %s' "$PUSH_BEFORE..$GITHUB_SHA")"
-            fi
-            [ -n "$NOTES" ] || NOTES="$(git log -1 --pretty=%s)"
+          # EVERY subject in the push, not just the head commit. A push is usually
+          # several commits and the head one is routinely the least interesting -- a
+          # docs commit riding along behind the actual change. PUSH_BEFORE is
+          # all-zeros on a branch's first push and stale after a force-push, so fall
+          # back whenever the range is unusable.
+          NOTES=""
+          if [ -n "${PUSH_BEFORE:-}" ] && git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
+            NOTES="$(git log --reverse --pretty='- %s' "$PUSH_BEFORE..$GITHUB_SHA")"
           fi
+          [ -n "$NOTES" ] || NOTES="$(git log -1 --pretty=%s)"
           # TestFlight renders this as RAW TEXT -- no markdown -- which is also
           # the screen-reader-friendliest form.
           { echo "notes<<__EOF__"; echo "$NOTES"; echo "__EOF__"; } >> "$GITHUB_OUTPUT"
@@ -381,10 +366,3 @@ jobs:
           name: ${{ inputs.artifact-name }}
           path: ${{ runner.temp }}/export/*
           if-no-files-found: warn
-
-      - name: Attach the build to the GitHub release
-        if: github.event_name == 'release'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.release.tag_name }}
-        run: gh release upload "$TAG" "$UPLOADED_FILE" --clobber
