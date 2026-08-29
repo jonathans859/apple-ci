@@ -349,9 +349,13 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ inputs.platform }}" = "macos" ]; then
-            FILE=$(ls "$RUNNER_TEMP/export/"*.pkg | head -1); FLAG=--pkg
+            FILE=$(ls "$RUNNER_TEMP/export/"*.pkg | head -1)
+            # asc reads the version and build number out of an .ipa, but cannot
+            # from a .pkg -- it requires them explicitly there.
+            ARGS="--pkg $FILE --version ${{ steps.version.outputs.marketing }} --build-number ${{ steps.version.outputs.build }}"
           else
-            FILE=$(ls "$RUNNER_TEMP/export/"*.ipa | head -1); FLAG=--ipa
+            FILE=$(ls "$RUNNER_TEMP/export/"*.ipa | head -1)
+            ARGS="--ipa $FILE"
           fi
           # asc infers the platform from the file (--pkg is always MAC_OS), which
           # is what makes a shared iOS+macOS app record safe here.
@@ -360,7 +364,7 @@ jobs:
           # once App Store Connect finishes processing.
           asc builds upload \
             --app "${{ inputs.app-id }}" \
-            $FLAG "$FILE" \
+            $ARGS \
             --test-notes "$NOTES" \
             --locale en-US
           cp "$FILE" "$RUNNER_TEMP/" 2>/dev/null || true
