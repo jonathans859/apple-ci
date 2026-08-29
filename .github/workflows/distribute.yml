@@ -78,6 +78,9 @@ jobs:
             printf '%s' "$ASC_KEY_P8" > "$KEY"
           fi
           grep -q "BEGIN PRIVATE KEY" "$KEY" || { echo "::error::ASC_KEY_P8 is not a valid .p8 key."; exit 1; }
+          # asc refuses a key file others can read ("private key file is too
+          # permissive"), which is right -- this one opens the whole account.
+          chmod 600 "$KEY"
           asc auth login --bypass-keychain --name ci \
             --key-id "$ASC_KEY_ID" --issuer-id "$ASC_ISSUER_ID" --private-key "$KEY"
 

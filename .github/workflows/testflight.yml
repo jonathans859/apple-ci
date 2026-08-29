@@ -221,6 +221,9 @@ jobs:
           grep -q "BEGIN PRIVATE KEY" "$KEY" || {
             echo "::error::ASC_KEY_P8 is not a valid .p8 key. Re-set it with: gh secret set ASC_KEY_P8 < AuthKey_XXXX.p8"
             exit 1; }
+          # asc refuses a key file others can read ("private key file is too
+          # permissive"), which is right -- this one opens the whole account.
+          chmod 600 "$KEY"
           # --bypass-keychain: a runner has no usable login keychain for asc's
           # credential store, and the config only records a path to the key above.
           asc auth login --bypass-keychain --name ci \
