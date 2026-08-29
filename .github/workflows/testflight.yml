@@ -339,6 +339,13 @@ jobs:
           { echo "notes<<__EOF__"; echo "$NOTES"; echo "__EOF__"; } >> "$GITHUB_OUTPUT"
 
       - name: Upload to TestFlight
+        env:
+          # Through the environment, never interpolated into the script: the notes
+          # are multi-line whenever a push carries several commits, and a value
+          # substituted into the script text breaks the quoting across lines --
+          # which surfaced as "--locale is required with --test-notes", an error
+          # about a flag that was right there in the file.
+          NOTES: ${{ steps.notes.outputs.notes }}
         run: |
           set -euo pipefail
           if [ "${{ inputs.platform }}" = "macos" ]; then
@@ -354,7 +361,7 @@ jobs:
           asc builds upload \
             --app "${{ inputs.app-id }}" \
             $FLAG "$FILE" \
-            --test-notes "${{ steps.notes.outputs.notes }}" \
+            --test-notes "$NOTES" \
             --locale en-US
           cp "$FILE" "$RUNNER_TEMP/" 2>/dev/null || true
           echo "UPLOADED_FILE=$FILE" >> "$GITHUB_ENV"
