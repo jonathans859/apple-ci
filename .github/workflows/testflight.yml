@@ -1,0 +1,387 @@
+name: TestFlight (reusable)
+
+# One TestFlight pipeline for every app on the account. Callers supply their
+# project's shape; everything else -- signing, versioning, changelog, upload --
+# is identical on purpose, because six divergent copies of this is what it
+# replaced.
+#
+# Secrets are inherited (`secrets: inherit`), which works because every repo on
+# the account uses the same names:
+#   ASC_KEY_ID  ASC_ISSUER_ID  ASC_KEY_P8  APPLE_TEAM_ID
+#   APPLE_DEV_CERT_P12  APPLE_DEV_CERT_P12_PASSWORD
+#
+# Reference this by TAG (@v1), never @main: a bad change here breaks every app
+# at once. One repo may track @main deliberately as the canary.
+
+on:
+  workflow_call:
+    inputs:
+      platform:
+        description: 'ios or macos'
+        required: true
+        type: string
+      project:
+        description: 'Xcode project, relative to working-directory (e.g. App.xcodeproj)'
+        required: true
+        type: string
+      scheme:
+        required: true
+        type: string
+      app-id:
+        description: 'App Store Connect numeric app id'
+        required: true
+        type: string
+      working-directory:
+        description: 'Directory the project lives in (NVRS builds from ios/)'
+        default: '.'
+        type: string
+      xcodegen-spec:
+        description: 'XcodeGen spec to generate from. Empty means the project is committed.'
+        default: ''
+        type: string
+      version-source:
+        description: 'Where MARKETING_VERSION is read from: xcodegen or pbxproj'
+        default: 'xcodegen'
+        type: string
+      artifact-name:
+        description: 'Name for the uploaded ipa/pkg artifact. Empty disables it.'
+        default: ''
+        type: string
+      runner:
+        # App Store Connect enforces an SDK floor on UPLOADS (2026: iOS 26 SDK),
+        # which macos-15 cannot meet. Only uploads have the floor -- a caller's
+        # own test job can stay on the older, stabler image.
+        default: 'macos-26'
+        type: string
+      timeout-minutes:
+        default: 45
+        type: number
+      asc-version:
+        # Pinned deliberately. asc is young and ships every few days, with 5.0.0
+        # deprecations already announced. Never track latest here.
+        default: '4.10.0'
+        type: string
+    outputs:
+      marketing:
+        description: 'Marketing version that was built'
+        value: ${{ jobs.testflight.outputs.marketing }}
+      build:
+        description: 'CFBundleVersion that was built'
+        value: ${{ jobs.testflight.outputs.build }}
+
+jobs:
+  testflight:
+    name: ${{ inputs.platform }} → TestFlight
+    runs-on: ${{ inputs.runner }}
+    # A signing step that raises a SecurityAgent GUI prompt hangs a headless
+    # runner forever instead of failing, and macOS minutes bill at 10x.
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    outputs:
+      marketing: ${{ steps.version.outputs.marketing }}
+      build: ${{ steps.version.outputs.build }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # build number is the commit count
+
+      - name: Select the newest Xcode
+        run: sudo xcode-select -s "$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
+
+      - name: Install asc
+        env:
+          V: ${{ inputs.asc-version }}
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            arm64|aarch64) ARCH=arm64 ;;
+            *)             ARCH=amd64 ;;
+          esac
+          case "$(uname -s)" in
+            Darwin) OS=macOS ;;
+            *)      OS=linux ;;
+          esac
+          BIN="asc_${V}_${OS}_${ARCH}"
+          BASE="https://github.com/rorkai/App-Store-Connect-CLI/releases/download/${V}"
+          curl -fsSL -o /tmp/asc "$BASE/$BIN"
+          curl -fsSL -o /tmp/asc_checksums.txt "$BASE/asc_${V}_checksums.txt"
+          # Verify before trusting it: this binary is handed the account's Admin
+          # API key. A checked checksum is the difference between pinning a
+          # version and pinning a version you actually got.
+          EXPECTED=$(grep " ${BIN}\$" /tmp/asc_checksums.txt | awk '{print $1}')
+          ACTUAL=$(shasum -a 256 /tmp/asc | awk '{print $1}')
+          if [ -z "$EXPECTED" ] || [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "::error::asc checksum mismatch for $BIN (expected '$EXPECTED', got '$ACTUAL')"
+            exit 1
+          fi
+          chmod +x /tmp/asc
+          sudo mv /tmp/asc /usr/local/bin/asc
+          asc --version
+
+      - name: Generate the Xcode project
+        if: inputs.xcodegen-spec != ''
+        run: |
+          brew install xcodegen
+          xcodegen generate --spec "${{ inputs.xcodegen-spec }}"
+
+      # The ARCHIVE step signs with an Apple *Development* identity; only the
+      # export re-sign is cloud-managed distribution signing. A throwaway runner
+      # has no such identity, so -allowProvisioningUpdates mints a brand-new
+      # certificate every run until the account-wide cap breaks signing for every
+      # repo on the team.
+      #
+      # ONE certificate serves the whole account. It cannot be split per repo:
+      # Apple returns 409 when minting a second Development certificate while one
+      # is current, because the certificate identifies the team, not an app.
+      - name: Import the shared Apple Development certificate
+        env:
+          APPLE_DEV_CERT_P12: ${{ secrets.APPLE_DEV_CERT_P12 }}
+          APPLE_DEV_CERT_P12_PASSWORD: ${{ secrets.APPLE_DEV_CERT_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          PASSWORD=$(openssl rand -hex 24)
+          security create-keychain -p "$PASSWORD" "$KEYCHAIN"
+          # Unlock BEFORE anything else touches it: keychain settings on a LOCKED
+          # keychain raise a SecurityAgent GUI prompt that hangs a headless runner
+          # forever rather than failing.
+          security unlock-keychain -p "$PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed 's/"//g')
+          security default-keychain -s "$KEYCHAIN"
+
+          printf '%s' "$APPLE_DEV_CERT_P12" | base64 --decode > "$RUNNER_TEMP/dev.p12"
+          security import "$RUNNER_TEMP/dev.p12" -k "$KEYCHAIN" \
+            -P "$APPLE_DEV_CERT_P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$PASSWORD" "$KEYCHAIN" >/dev/null
+
+          # Assert now: a failed import does NOT fail this step and surfaces ten
+          # minutes later as "no signing certificate found". Note a REVOKED .p12
+          # also imports cleanly and also passes this check, so the real proof is
+          # that `asc certificates list` shows no new certificate after a build.
+          security find-identity -v -p codesigning | grep -q "Apple Development" \
+            || { echo "::error::Apple Development certificate did not import. Check APPLE_DEV_CERT_P12 / _PASSWORD; the .p12 must be legacy format (-certpbe PBE-SHA1-3DES -keypbe PBE-SHA1-3DES -macalg sha1)."; exit 1; }
+
+      - name: Work out the version and build number
+        id: version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          SPEC: ${{ inputs.xcodegen-spec }}
+          PROJECT: ${{ inputs.project }}
+          SOURCE: ${{ inputs.version-source }}
+        run: |
+          set -euo pipefail
+          if [ "$SOURCE" = "pbxproj" ]; then
+            VERSION=$(sed -n 's/^[[:space:]]*MARKETING_VERSION = \(.*\);$/\1/p' "$PROJECT/project.pbxproj" | head -1)
+          else
+            VERSION=$(sed -n 's/^ *MARKETING_VERSION: *"\{0,1\}\([^"]*\)"\{0,1\}.*/\1/p' "${SPEC:-project.yml}" | head -1)
+          fi
+          [ -n "$VERSION" ] || { echo "::error::Could not read MARKETING_VERSION"; exit 1; }
+
+          if [ "${{ github.event_name }}" = "release" ]; then
+            # vX.Y.Z raises the marketing version (its first external build waits
+            # on Beta App Review). vX.Y.Z-bN re-releases the SAME version, which
+            # usually reaches external testers review-free.
+            TAG_VERSION="${TAG#v}"; TAG_VERSION="${TAG_VERSION%%-b*}"
+            if [ "$TAG_VERSION" != "$VERSION" ]; then
+              echo "::error::Tag $TAG implies version $TAG_VERSION but the project says $VERSION at this commit."
+              exit 1
+            fi
+            KIND=1
+          else
+            KIND=0
+          fi
+          # commit count is monotonic on main and recomputable from any checkout;
+          # KIND keeps the push build and the release build of one commit distinct;
+          # the run attempt keeps a re-run unique after an attempt already uploaded.
+          BUILD="$(git rev-list --count HEAD).$KIND.${GITHUB_RUN_ATTEMPT}"
+          echo "marketing=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
+          echo "Building $VERSION ($BUILD)"
+
+      - name: Authenticate asc
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/asc"
+          KEY="$RUNNER_TEMP/asc/AuthKey.p8"
+          # Accept the secret as base64 OR as raw .p8 text: re-setting it the
+          # other way is easy and the resulting failure is opaque.
+          if printf '%s' "$ASC_KEY_P8" | base64 --decode 2>/dev/null | grep -q "BEGIN PRIVATE KEY"; then
+            printf '%s' "$ASC_KEY_P8" | base64 --decode > "$KEY"
+          else
+            printf '%s' "$ASC_KEY_P8" > "$KEY"
+          fi
+          grep -q "BEGIN PRIVATE KEY" "$KEY" || {
+            echo "::error::ASC_KEY_P8 is not a valid .p8 key. Re-set it with: gh secret set ASC_KEY_P8 < AuthKey_XXXX.p8"
+            exit 1; }
+          # --bypass-keychain: a runner has no usable login keychain for asc's
+          # credential store, and the config only records a path to the key above.
+          asc auth login --bypass-keychain --name ci \
+            --key-id "$ASC_KEY_ID" --issuer-id "$ASC_ISSUER_ID" --private-key "$KEY"
+
+      - name: Archive (iOS — cloud signing)
+        if: inputs.platform == 'ios'
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          xcodebuild archive \
+            -project "${{ inputs.project }}" \
+            -scheme "${{ inputs.scheme }}" \
+            -destination 'generic/platform=iOS' \
+            -configuration Release \
+            -archivePath "$RUNNER_TEMP/app.xcarchive" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/asc/AuthKey.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            DEVELOPMENT_TEAM="${{ secrets.APPLE_TEAM_ID }}" \
+            MARKETING_VERSION="${{ steps.version.outputs.marketing }}" \
+            CURRENT_PROJECT_VERSION="${{ steps.version.outputs.build }}"
+
+      # The macOS archive is AD-HOC signed, unlike iOS, and both constraints below
+      # have to hold at once:
+      #
+      # 1. It must not need a development provisioning profile. Automatic signing
+      #    wants one, and Apple issues iOS development profiles to a team with no
+      #    registered devices but NOT Mac ones -- so from the moment a Mac target
+      #    gains an App-ID-level capability (iCloud, Push, Sign in with Apple) the
+      #    archive dies with "Your team has no devices from which to generate a
+      #    provisioning profile". With development happening on Windows there is no
+      #    Mac to register, so that path is a dead end, not a missing setup step.
+      # 2. It must still carry the entitlements. CODE_SIGNING_ALLOWED=NO clears (1)
+      #    but produces an unsigned binary with no entitlements for the export
+      #    re-sign to propagate, and the upload is rejected with "App sandbox not
+      #    enabled ... (90296)" -- fatal, since the sandbox is mandatory for the
+      #    Mac App Store.
+      #
+      # An ad-hoc signature embeds entitlements without contacting Apple for a
+      # certificate or profile. Export then re-signs with the cloud-managed
+      # distribution certificate and a Mac App Store profile, which is not
+      # device-bound.
+      - name: Archive (macOS — ad-hoc; export does the cloud signing)
+        if: inputs.platform == 'macos'
+        run: |
+          set -euo pipefail
+          xcodebuild archive \
+            -project "${{ inputs.project }}" \
+            -scheme "${{ inputs.scheme }}" \
+            -destination 'generic/platform=macOS' \
+            -configuration Release \
+            -archivePath "$RUNNER_TEMP/app.xcarchive" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="-" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            DEVELOPMENT_TEAM="${{ secrets.APPLE_TEAM_ID }}" \
+            MARKETING_VERSION="${{ steps.version.outputs.marketing }}" \
+            CURRENT_PROJECT_VERSION="${{ steps.version.outputs.build }}"
+
+      - name: Verify the archive kept its entitlements (macOS)
+        if: inputs.platform == 'macos'
+        run: |
+          APP=$(ls -d "$RUNNER_TEMP/app.xcarchive/Products/Applications/"*.app | head -1)
+          codesign -d --entitlements :- "$APP" > "$RUNNER_TEMP/entitlements.plist" 2>/dev/null
+          cat "$RUNNER_TEMP/entitlements.plist"
+          grep -q "com.apple.security.app-sandbox" "$RUNNER_TEMP/entitlements.plist" || {
+            echo "::error::Archived app lost the app-sandbox entitlement — the upload would be rejected with 90296."
+            exit 1; }
+
+      - name: Export
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>export</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>teamID</key><string>${{ secrets.APPLE_TEAM_ID }}</string>
+            <!-- Xcode otherwise rewrites CFBundleVersion at export to its own
+                 sequential number, silently discarding the commit-count scheme
+                 that the release promote step recomputes to find this build. -->
+            <key>manageAppVersionAndBuildNumber</key><false/>
+          </dict></plist>
+          EOF
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/app.xcarchive" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/asc/AuthKey.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+          ls -la "$RUNNER_TEMP/export"
+
+      - name: Compose the "What to Test" text
+        id: notes
+        env:
+          PUSH_BEFORE: ${{ github.event.before }}
+          RELEASE_BODY: ${{ github.event.release.body }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "release" ]; then
+            NOTES="$RELEASE_BODY"
+            [ -n "$NOTES" ] || { echo "::error::The release body is empty — it is the What to Test text testers read."; exit 1; }
+          else
+            # EVERY subject in the push, not just the head commit. A push is
+            # usually several commits and the head one is routinely the least
+            # interesting -- a docs commit riding along behind the actual change.
+            # PUSH_BEFORE is all-zeros on a branch's first push and stale after a
+            # force-push, so fall back whenever the range is unusable.
+            NOTES=""
+            if [ -n "${PUSH_BEFORE:-}" ] && git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
+              NOTES="$(git log --reverse --pretty='- %s' "$PUSH_BEFORE..$GITHUB_SHA")"
+            fi
+            [ -n "$NOTES" ] || NOTES="$(git log -1 --pretty=%s)"
+          fi
+          # TestFlight renders this as RAW TEXT -- no markdown -- which is also
+          # the screen-reader-friendliest form.
+          { echo "notes<<__EOF__"; echo "$NOTES"; echo "__EOF__"; } >> "$GITHUB_OUTPUT"
+
+      - name: Upload to TestFlight
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.platform }}" = "macos" ]; then
+            FILE=$(ls "$RUNNER_TEMP/export/"*.pkg | head -1); FLAG=--pkg
+          else
+            FILE=$(ls "$RUNNER_TEMP/export/"*.ipa | head -1); FLAG=--ipa
+          fi
+          # asc infers the platform from the file (--pkg is always MAC_OS), which
+          # is what makes a shared iOS+macOS app record safe here.
+          # --test-notes waits only until the build APPEARS, then writes the
+          # localization; the internal group's automatic distribution delivers it
+          # once App Store Connect finishes processing.
+          asc builds upload \
+            --app "${{ inputs.app-id }}" \
+            $FLAG "$FILE" \
+            --test-notes "${{ steps.notes.outputs.notes }}" \
+            --locale en-US
+          cp "$FILE" "$RUNNER_TEMP/" 2>/dev/null || true
+          echo "UPLOADED_FILE=$FILE" >> "$GITHUB_ENV"
+
+      - name: Upload the build as an artifact
+        if: inputs.artifact-name != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ runner.temp }}/export/*
+          if-no-files-found: warn
+
+      - name: Attach the build to the GitHub release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" "$UPLOADED_FILE" --clobber
