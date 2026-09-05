@@ -84,7 +84,7 @@ jobs:
       build: ${{ steps.version.outputs.build }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # build number is the commit count
 
@@ -378,7 +378,7 @@ jobs:
 
       - name: Upload the build as an artifact
         if: inputs.artifact-name != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ inputs.artifact-name }}
           path: ${{ runner.temp }}/artifact/*
