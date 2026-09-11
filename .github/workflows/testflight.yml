@@ -82,6 +82,7 @@ jobs:
     outputs:
       marketing: ${{ steps.version.outputs.marketing }}
       build: ${{ steps.version.outputs.build }}
+      notes: ${{ steps.notes.outputs.notes }}
 
     steps:
       - uses: actions/checkout@v7
@@ -339,13 +340,6 @@ jobs:
           { echo "notes<<__EOF__"; echo "$NOTES"; echo "__EOF__"; } >> "$GITHUB_OUTPUT"
 
       - name: Upload to TestFlight
-        env:
-          # Through the environment, never interpolated into the script: the notes
-          # are multi-line whenever a push carries several commits, and a value
-          # substituted into the script text breaks the quoting across lines --
-          # which surfaced as "--locale is required with --test-notes", an error
-          # about a flag that was right there in the file.
-          NOTES: ${{ steps.notes.outputs.notes }}
         run: |
           set -euo pipefail
           if [ "${{ inputs.platform }}" = "macos" ]; then
@@ -359,14 +353,17 @@ jobs:
           fi
           # asc infers the platform from the file (--pkg is always MAC_OS), which
           # is what makes a shared iOS+macOS app record safe here.
-          # --test-notes waits only until the build APPEARS, then writes the
-          # localization; the internal group's automatic distribution delivers it
-          # once App Store Connect finishes processing.
+          #
+          # Deliberately WITHOUT --test-notes. That flag makes the upload wait
+          # until the build appears in App Store Connect so it can write the
+          # localization, which took minutes and was the longest step in the
+          # whole pipeline -- minutes spent polling an API on a macOS runner
+          # billing at 10x. The notes are written by the `test-notes` job below,
+          # on Linux, at 1x. The upload itself now returns once the binary is
+          # transferred.
           asc builds upload \
             --app "${{ inputs.app-id }}" \
-            $ARGS \
-            --test-notes "$NOTES" \
-            --locale en-US
+            $ARGS
           # Stage ONLY the build product for the artifact. xcodebuild also leaves
           # DistributionSummary.plist, ExportOptions.plist and Packaging.log in the
           # export directory; shipping those in the artifact put them on the GitHub
@@ -383,3 +380,104 @@ jobs:
           name: ${{ inputs.artifact-name }}
           path: ${{ runner.temp }}/artifact/*
           if-no-files-found: warn
+
+  # Writing the "What to Test" text is pure App Store Connect polling: it waits
+  # for the uploaded build to appear, which takes minutes and needs no Xcode, no
+  # signing and no Mac. Doing it inside the upload above was the single longest
+  # step in the pipeline, and every one of those minutes billed at the macOS 10x
+  # rate. Here the same wait costs 1x.
+  #
+  # It never fails the run. The build is already uploaded and reaches internal
+  # testers on its own; missing notes is a blemish, and a red cross on a build
+  # that actually shipped would be a worse lie than the blemish.
+  test-notes:
+    name: What to Test
+    needs: testflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Install asc
+        env:
+          V: ${{ inputs.asc-version }}
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            arm64|aarch64) ARCH=arm64 ;;
+            *)             ARCH=amd64 ;;
+          esac
+          case "$(uname -s)" in
+            Darwin) OS=macOS ;;
+            *)      OS=linux ;;
+          esac
+          BIN="asc_${V}_${OS}_${ARCH}"
+          BASE="https://github.com/rorkai/App-Store-Connect-CLI/releases/download/${V}"
+          curl -fsSL -o /tmp/asc "$BASE/$BIN"
+          curl -fsSL -o /tmp/asc_checksums.txt "$BASE/asc_${V}_checksums.txt"
+          # Verify before trusting it: this binary is handed the account's Admin
+          # API key. A checked checksum is the difference between pinning a
+          # version and pinning a version you actually got.
+          EXPECTED=$(grep " ${BIN}\$" /tmp/asc_checksums.txt | awk '{print $1}')
+          ACTUAL=$(shasum -a 256 /tmp/asc | awk '{print $1}')
+          if [ -z "$EXPECTED" ] || [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "::error::asc checksum mismatch for $BIN (expected '$EXPECTED', got '$ACTUAL')"
+            exit 1
+          fi
+          chmod +x /tmp/asc
+          sudo mv /tmp/asc /usr/local/bin/asc
+          asc --version
+
+      - name: Authenticate asc
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/asc"
+          KEY="$RUNNER_TEMP/asc/AuthKey.p8"
+          if printf '%s' "$ASC_KEY_P8" | base64 --decode 2>/dev/null | grep -q "BEGIN PRIVATE KEY"; then
+            printf '%s' "$ASC_KEY_P8" | base64 --decode > "$KEY"
+          else
+            printf '%s' "$ASC_KEY_P8" > "$KEY"
+          fi
+          grep -q "BEGIN PRIVATE KEY" "$KEY" || {
+            echo "::error::ASC_KEY_P8 is not a valid .p8 key."; exit 1; }
+          chmod 600 "$KEY"
+          asc auth login --bypass-keychain --name ci \
+            --key-id "$ASC_KEY_ID" --issuer-id "$ASC_ISSUER_ID" --private-key "$KEY"
+
+      - name: Wait for the build, then write the notes
+        env:
+          APP: ${{ inputs.app-id }}
+          MARKETING: ${{ needs.testflight.outputs.marketing }}
+          BUILD: ${{ needs.testflight.outputs.build }}
+          # asc names platforms IOS / MAC_OS, the caller says ios / macos.
+          PLATFORM: ${{ inputs.platform == 'macos' && 'MAC_OS' || 'IOS' }}
+          # Through the environment, never interpolated into the script: the
+          # notes are multi-line whenever a push carries several commits, and a
+          # value substituted into the script text breaks the quoting across
+          # lines -- which surfaced as "--locale is required with --test-notes",
+          # an error about a flag that was right there in the file.
+          NOTES: ${{ needs.testflight.outputs.notes }}
+        run: |
+          set -uo pipefail
+          # No separate existence check: update-or-create *is* the check, and it
+          # is idempotent, so retrying costs nothing and one round trip does the
+          # work two would.
+          write_notes () {
+            asc builds test-notes update --app "$APP" --version "$MARKETING" \
+              --build-number "$BUILD" --platform "$PLATFORM" --locale en-US --whats-new "$NOTES" \
+            || asc builds test-notes create --app "$APP" --version "$MARKETING" \
+              --build-number "$BUILD" --platform "$PLATFORM" --locale en-US --whats-new "$NOTES"
+          }
+          n=0
+          until write_notes; do
+            n=$((n + 1))
+            if [ "$n" -ge 20 ]; then
+              echo "::warning::Build $MARKETING ($BUILD) did not appear within 10 minutes, so it has no What to Test text. The build itself uploaded fine and still reaches internal testers; set the notes by hand in App Store Connect, or re-run this job."
+              exit 0
+            fi
+            echo "Build $MARKETING ($BUILD) is still processing (attempt $n) - waiting 30s"
+            sleep 30
+          done
+          echo "Wrote the What to Test text for $MARKETING ($BUILD)."
