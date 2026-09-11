@@ -470,14 +470,24 @@ jobs:
             || asc builds test-notes create --app "$APP" --version "$MARKETING" \
               --build-number "$BUILD" --platform "$PLATFORM" --locale en-US --whats-new "$NOTES"
           }
+          # Forty minutes. The first version allowed ten and gave up while App
+          # Store Connect was still indexing the build -- the error was "no build
+          # found", which is what "not there yet" looks like from here.
+          # release.yml has always budgeted up to 90 minutes for the same wait,
+          # so ten was the outlier. Waiting is why this job is on Linux: a
+          # minute of it costs a tenth of a minute on the macOS runner.
+          ATTEMPTS=40
           n=0
-          until write_notes; do
+          until write_notes 2>"$RUNNER_TEMP/asc.err"; do
             n=$((n + 1))
-            if [ "$n" -ge 20 ]; then
-              echo "::warning::Build $MARKETING ($BUILD) did not appear within 10 minutes, so it has no What to Test text. The build itself uploaded fine and still reaches internal testers; set the notes by hand in App Store Connect, or re-run this job."
+            # Once, not forty times: the same two-line error repeated per attempt
+            # buries the one line that says which attempt is current.
+            if [ "$n" = 1 ]; then sed 's/^/  /' "$RUNNER_TEMP/asc.err"; fi
+            if [ "$n" -ge "$ATTEMPTS" ]; then
+              echo "::warning::Build $MARKETING ($BUILD) had not appeared in App Store Connect after $ATTEMPTS minutes, so it has no What to Test text. The build itself uploaded fine and still reaches internal testers; set the notes by hand, or re-run this job once the build shows up."
               exit 0
             fi
-            echo "Build $MARKETING ($BUILD) is still processing (attempt $n) - waiting 30s"
-            sleep 30
+            echo "Build $MARKETING ($BUILD) not in App Store Connect yet (attempt $n of $ATTEMPTS) - waiting 60s"
+            sleep 60
           done
           echo "Wrote the What to Test text for $MARKETING ($BUILD)."
