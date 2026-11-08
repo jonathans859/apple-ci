@@ -166,6 +166,14 @@ checksum is verified before it is handed the account's Admin API key. asc is
 young and ships every few days, with 5.0.0 deprecations already announced — never
 track `latest`. Bump it here, let the canary build, then move the tag.
 
+The binary and its checksum file are **cached per version, OS and arch**
+(`actions/cache`, saved right after the install), and downloads retry with
+backoff. GitHub release assets can 504 for an hour while the rest of GitHub
+reports itself operational; on 2026-11-08 that killed four TestFlight runs in a
+row before they built anything. With the cache, a run only touches the network
+when `asc-version` changes. The checksum is still verified on every run, and a
+mismatch deletes the files, so a bad download is never cached.
+
 Known gap: `asc builds add-groups` has no explicit "notify testers" flag, where
 fastlane's `pilot` had `--notify_external_testers`. App Store Connect's own group
 notification setting governs it instead.

@@ -168,6 +168,18 @@ jobs:
             gh release upload "$TAG" "$f" --clobber
           done
 
+      # asc comes from GitHub release assets, which can 504 for an hour while
+      # the rest of GitHub is up (2026-11-08: four TestFlight runs in a row died
+      # here before building anything). Cached per version/OS/arch, a run only
+      # downloads when the pinned version changes. Saved straight after the
+      # install, not at job end, so a run that later fails still fills it.
+      - name: Restore cached asc
+        id: asc-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.cache/asc
+          key: asc-${{ inputs.asc-version }}-${{ runner.os }}-${{ runner.arch }}
+
       - name: Install asc
         env:
           V: ${{ inputs.asc-version }}
@@ -176,16 +188,30 @@ jobs:
           case "$(uname -m)" in aarch64|arm64) ARCH=arm64 ;; *) ARCH=amd64 ;; esac
           BIN="asc_${V}_linux_${ARCH}"
           BASE="https://github.com/rorkai/App-Store-Connect-CLI/releases/download/${V}"
-          curl -fsSL -o /tmp/asc "$BASE/$BIN"
-          curl -fsSL -o /tmp/asc_checksums.txt "$BASE/asc_${V}_checksums.txt"
-          EXPECTED=$(grep " ${BIN}\$" /tmp/asc_checksums.txt | awk '{print $1}')
-          ACTUAL=$(sha256sum /tmp/asc | awk '{print $1}')
+          DIR="$HOME/.cache/asc"
+          mkdir -p "$DIR"
+          # Exponential backoff on any error (1 s, 2 s, 4 s ... ~4 min in all):
+          # release downloads fail intermittently, and one 504 must not fail a
+          # build. A cached copy skips the network entirely.
+          fetch() { curl -fsSL --retry 8 --retry-all-errors --retry-max-time 600 -o "$1" "$2"; }
+          [ -s "$DIR/$BIN" ] || fetch "$DIR/$BIN" "$BASE/$BIN"
+          [ -s "$DIR/checksums.txt" ] || fetch "$DIR/checksums.txt" "$BASE/asc_${V}_checksums.txt"
+          EXPECTED=$(grep " ${BIN}\$" "$DIR/checksums.txt" | awk '{print $1}')
+          ACTUAL=$(sha256sum "$DIR/$BIN" | awk '{print $1}')
           if [ -z "$EXPECTED" ] || [ "$EXPECTED" != "$ACTUAL" ]; then
+            rm -f "$DIR/$BIN" "$DIR/checksums.txt"
             echo "::error::asc checksum mismatch for $BIN"
             exit 1
           fi
-          chmod +x /tmp/asc && sudo mv /tmp/asc /usr/local/bin/asc
+          sudo install -m 0755 "$DIR/$BIN" /usr/local/bin/asc
           asc --version
+
+      - name: Cache asc
+        if: steps.asc-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cache/asc
+          key: asc-${{ inputs.asc-version }}-${{ runner.os }}-${{ runner.arch }}
 
       - name: Authenticate asc
         env:
